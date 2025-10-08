@@ -21,8 +21,8 @@ def split_series(series, n_past, n_future):
 
 def get_precise_cluster(cluster_id):
     
-    #return pd.read_csv("./data/mtr"+str(cluster_id+1)+".csv")
-    return pd.read_csv("./data/mtr_full.csv")
+    return pd.read_csv("./data/metr"+str(cluster_id+1)+".csv") if cluster_id != -1 else pd.read_hdf("./data/metr_full.h5")
+     
 
 
 def get_prepared_dataset(df, n_past, n_future, n_features):
