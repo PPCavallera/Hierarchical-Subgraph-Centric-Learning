@@ -1,122 +1,204 @@
-import tensorflow as tf
-from sklearn.metrics import mean_squared_error
-import matplotlib.pyplot as plt
-import pandas as pd
+import torch
+from torch.optim.lr_scheduler import LambdaLR
+import torch.nn as nn
+import numpy as np
+import torch.optim as optim
+from sklearn.metrics import mean_absolute_error, mean_squared_error, root_mean_squared_error
+import time
 
-def train_models(
-        X_train,
-        y_train,
-        X_test,
-        y_test,
-        model_1,
-        model_2,
-        bs=8,
-        nb_epochs=100):
-    # Training the models
-    nb_epochs = nb_epochs
-    reduce_lr = tf.keras.callbacks.LearningRateScheduler(
-        lambda x: 1e-3 * 0.90 ** x)
-    # earlyStopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss',
-    #                                          patience=5)
-    print("--- FIRST MODEL ---")
-    model_1.compile(
-        optimizer=tf.keras.optimizers.Adam(),
-        loss=tf.keras.losses.Huber())
-    history_1 = model_1.fit(
-        X_train,
-        y_train,
-        epochs=nb_epochs,
-        validation_data=(
-            X_test,
-            y_test),
-        batch_size=bs,
-        verbose=2,
-        callbacks=[reduce_lr])
-    print("--- SECOND MODEL ---")
-    model_2.compile(
-        optimizer=tf.keras.optimizers.Adam(),
-        loss=tf.keras.losses.Huber())
-    history_2 = model_2.fit(
-        X_train,
-        y_train,
-        epochs=nb_epochs,
-        validation_data=(
-            X_test,
-            y_test),
-        batch_size=bs,
-        verbose=2,
-        callbacks=[reduce_lr])
+def train_dcrnn_model(model, dataloader, criterion, optimizer, device):
 
-    return model_1, model_2, history_1, history_2
+    model.train()
+    total_loss = 0
+    cost = 0
+    for time, (X_batch, edges_index, edges_attr,
+               y_batch) in enumerate(dataloader):
+        X_batch = X_batch.to(device).float()
+        y_batch = y_batch.to(device).float()
+        edges_index = edges_index.to(device)
+        edges_attr = edges_attr.to(device).float()
+        optimizer.zero_grad()
+        y_pred = model(X_batch, edges_index, edges_attr)
+        cost = cost + torch.mean((y_pred.squeeze() - y_batch)**2)
+    cost = cost / (time + 1)
+
+    cost.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+
+    avg_loss = total_loss / len(dataloader)
+    return cost.cpu().item()
 
 
-def save_loss_graphs(history_1, history_2, loss_name, nb_epochs=100):
-    loss_e1d1 = history_1.history["loss"]
-    val_loss_e1d1 = history_1.history["val_loss"]
+def evaluate_dcrnn_model(model, dataloader, criterion, device,):
 
-    loss_e2d2 = history_2.history["loss"]
-    val_loss_e2d2 = history_2.history["val_loss"]
+    model.eval()
 
-    # Plot
-    plt.figure(figsize=(10, 6))
-    epochs = range(1, nb_epochs + 1)
+    total_loss = 0
+    all_y_batch_np = []
+    all_y_pred_np = []
+    with torch.no_grad():
+        for X_batch, edges_index, edges_attr, y_batch in dataloader:
+            X_batch = X_batch.to(device).float()
+            y_batch = y_batch.to(device).float()
+            edges_index = edges_index.to(device)
+            edges_attr = edges_attr.to(device).float()
+            y_pred = model(X_batch, edges_index, edges_attr)
 
-    # Model e1d1
-    plt.plot(epochs, loss_e1d1, label="Train Loss e1d1")
-    plt.plot(epochs, val_loss_e1d1, label="Val Loss e1d1")
+            loss = criterion(y_pred.reshape(-1), y_batch)
 
-    # Model e2d2
-    plt.plot(epochs, loss_e2d2, label="Train Loss e2d2")
-    plt.plot(epochs, val_loss_e2d2, label="Val Loss e2d2")
-
-    plt.xlabel("Epochs")
-    plt.ylabel("Loss (Huber)")
-    plt.title("Training & Validation Loss Evolution")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(loss_name + ".png")
-    loss_df = pd.DataFrame({"loss_m1": loss_e1d1,
-                            "val_loss_m1": val_loss_e1d1,
-                            "loss_m2": loss_e2d2,
-                            "val_loss_m2": val_loss_e2d2})
-    loss_df.to_csv(loss_name + ".csv", index=False)
-
-
-def get_test_loss(X_test, y_test, model_1, model_2, name):
-    pred_e1d1 = model_1.predict(X_test)
-    pred_e2d2 = model_2.predict(X_test)
-    print(y_test.shape)
-    loss_1, loss_2 = 0, 0
-    for index in range(y_test.shape[2]):
-
-        for j in range(y_test.shape[1]):
-            print("Day ", j, ":")
-            mse_1, mse_2 = mean_squared_error(y_test[:, j - 1, index], pred_e1d1[:, j - 1, index]), mean_squared_error(y_test[:, j - 1, index], pred_e2d2[:, j - 1, index])
-            print("MSE-M1 : ", mse_1, end=", ")
-            print("MSE-M2 : ", mse_2)
-            loss_1 += mse_1
-            loss_2 += mse_2
-    print(f'GLOBAL PRECISION : MSE MODEL 1 : {loss_1 /(y_test.shape[0] *y_test.shape[2]) if (y_test.shape[0]*y_test.shape[2])>0 else loss_1} --- MSE MODEL 2 : {loss_2 /(y_test.shape[0] * y_test.shape[2]) if (y_test.shape[0]*y_test.shape[2])>0 else loss_2}')
+            total_loss += loss.item()
+            y_pred_np = y_pred.detach().cpu().reshape(-1).numpy()
+            all_y_pred_np.append(y_pred_np)
+            
+            # Store true values
+            y_batch_np = y_batch.detach().cpu().reshape(-1).numpy()
+            all_y_batch_np.append(y_batch_np)
+            avg_loss = total_loss / len(dataloader)
+    final_y_pred_np = np.concatenate(all_y_pred_np)
+    final_y_batch_np = np.concatenate(all_y_batch_np)
+    tmp_final_y_pred_np = np.stack(all_y_pred_np)
+    tmp_final_y_batch_np = np.stack(all_y_batch_np)
+    print(f"Validation Losses: MSE : {mean_squared_error(final_y_batch_np, final_y_pred_np):.6f} MAE : {mean_absolute_error(final_y_batch_np, final_y_pred_np):.6f} RMSE : {root_mean_squared_error(final_y_batch_np, final_y_pred_np):.6f}")
     
-    for feat_idx in range(pred_e1d1.shape[2]):
+    return tmp_final_y_pred_np, tmp_final_y_batch_np
+
+
+
+def train_encoder_decoder_model(
+        model,
+        dataloader,
+        criterion,
+        optimizer,
+        device):
+
+    model.train()
+    total_loss = 0
+
+    for batch_idx, (X_batch, _, _, y_batch) in enumerate(dataloader):
+        X_batch = X_batch.to(device).float()
+        y_batch = y_batch.to(device).float()
+        optimizer.zero_grad()
+        y_pred = model(X_batch)
+        loss = criterion(y_pred, y_batch)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+
+    avg_loss = total_loss / len(dataloader)
+    return avg_loss
+
+
+def evaluate_encoder_decoder_model(model, dataloader, criterion, device):
+
+    model.eval()
+
+    total_loss = 0
+    all_y_batch_np = []
+    all_y_pred_np = []
     
-        truth_series = y_test[:min(100, len(y_test)), 0, feat_idx]   # take the "day+1" target from each window
+    with torch.no_grad():
+        for X_batch, _, _, y_batch in dataloader:
+            X_batch = X_batch.to(device).float()
+            y_batch = y_batch.to(device).float()
 
-    # predictions: take the same "day+1" forecast from each model
-        pred_series_e1d1 = pred_e1d1[:min(100, len(y_test)), 0, feat_idx]
-        pred_series_e2d2 = pred_e2d2[:min(100, len(y_test)), 0, feat_idx]
+            y_pred = model(X_batch)
+            loss = criterion(y_pred.reshape(-1), y_batch.reshape(-1))
+            # print(y_pred.shape, y_batch.shape)
+            total_loss += loss.item()
+            y_pred_np = y_pred.detach().cpu().reshape(-1).numpy()
+            all_y_pred_np.append(y_pred_np)
+            
+            # Store true values
+            y_batch_np = y_batch.detach().cpu().reshape(-1).numpy()
+            all_y_batch_np.append(y_batch_np)
+            avg_loss = total_loss / len(dataloader)
+    final_y_pred_np = np.concatenate(all_y_pred_np)
+    final_y_batch_np = np.concatenate(all_y_batch_np)
+    tmp_final_y_pred_np = np.stack(all_y_pred_np)
+    tmp_final_y_batch_np = np.stack(all_y_batch_np)
+    print(f"Validation Losses: MSE : {mean_squared_error(final_y_batch_np, final_y_pred_np):.6f} MAE : {mean_absolute_error(final_y_batch_np, final_y_pred_np):.6f} RMSE : {root_mean_squared_error(final_y_batch_np, final_y_pred_np):.6f}")
 
-        # align with actual test dates (skip first n_past days used as input)
-        test_dates = [i for i in range(min(100, len(pred_e1d1)))]
-
-        plt.figure(figsize=(12,4))
-        plt.plot(test_dates, truth_series, label="True", linewidth=2)
-        plt.plot(test_dates, pred_series_e1d1, label="Pred LSTM 1 Hidden Layer", linestyle="--")
-        plt.plot(test_dates, pred_series_e2d2, label="Pred LSTM 2 Hidden Layers", linestyle="--")
-        #plt.title(f"Predictions vs Truth for feature")
-        plt.xlabel("Index")
-        plt.ylabel("Value")
-        plt.legend()
-        plt.savefig(name+"_vertice"+str(feat_idx)+".png")
+    return tmp_final_y_pred_np, tmp_final_y_batch_np
 
 
+def exponential_decay_fn(epoch):
+
+    return 0.91 ** epoch
+
+
+def training_loop(
+        epochs,
+        model,
+        train_dataloader,
+        mode="DCRNN"):
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=1e-2)
+
+    if mode == "LSTM":
+        reduce_lr_scheduler = LambdaLR(
+            optimizer,
+            lr_lambda=exponential_decay_fn
+        )
+
+        print(f"Starting training on {device} for {epochs} epochs...")
+        start_time = time.time()
+        
+        training_losses = []
+        test_losses = []
+        for epoch in range(1, epochs + 1):
+            epoch_loss = train_encoder_decoder_model(
+                model,
+                train_dataloader,
+                criterion,
+                optimizer,
+                device
+            )
+            print(f"Epoch {epoch}/{epochs} | Training Loss: {epoch_loss:.6f} ")
+
+            reduce_lr_scheduler.step()
+            current_lr = optimizer.param_groups[0]['lr']
+            training_losses.append(epoch_loss)
+        print(f"Training finished in {time.time() - start_time}s")
+    elif mode == "DCRNN":
+        print(f"Starting training on {device} for {epochs} epochs...")
+        start_time = time.time()
+
+        training_losses = []
+        test_losses = []
+        for epoch in range(1, epochs + 1):
+            epoch_loss = train_dcrnn_model(
+                model,
+                train_dataloader,
+                criterion,
+                optimizer,
+                device,
+            )
+            print(f"Epoch {epoch}/{epochs} | Training Loss: {epoch_loss:.6f} ")
+
+            training_losses.append(epoch_loss)
+        print(f"Training finished in {time.time() - start_time}s")
+
+
+def validation_loop(
+        model,
+        val_dataloader,
+        mode="DCRNN"):
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    criterion = nn.MSELoss()
+
+    if mode == "LSTM":
+
+        Y_pred, Y_true = evaluate_encoder_decoder_model(
+            model, val_dataloader, criterion, device)
+        return Y_pred, Y_true
+    
+    elif mode == "DCRNN":
+
+        Y_pred, Y_true = evaluate_dcrnn_model(
+            model, val_dataloader, criterion, device)
+        return Y_pred, Y_true 

@@ -1,53 +1,376 @@
-import tensorflow as tf
+import math
+import torch
+from torch_geometric.utils import to_dense_adj, dense_to_sparse
+from torch_geometric.nn.conv import MessagePassing
+import torch.nn.functional as F
+import torch.nn as nn
 
 
-def get_model_1(n_past, n_features, n_future, units=100):
-    encoder_inputs = tf.keras.layers.Input(shape=(n_past, n_features))
-    encoder_l1 = tf.keras.layers.LSTM(units, return_state=True)
-    encoder_outputs1 = encoder_l1(encoder_inputs)
+class DConv(MessagePassing):
+    r"""An implementation of the Diffusion Convolution Layer.
+    For details see: `"Diffusion Convolutional Recurrent Neural Network:
+    Data-Driven Traffic Forecasting" <https://arxiv.org/abs/1707.01926>`_
 
-    encoder_states1 = encoder_outputs1[1:]
+    Args:
+        in_channels (int): Number of input features.
+        out_channels (int): Number of output features.
+        K (int): Filter size :math:`K`.
+        bias (bool, optional): If set to :obj:`False`, the layer
+            will not learn an additive bias (default :obj:`True`).
 
-    decoder_inputs = tf.keras.layers.RepeatVector(
-        n_future)(encoder_outputs1[0])
+    """
 
-    decoder_l1 = tf.keras.layers.LSTM(
-        units, return_sequences=True)(
-        decoder_inputs, initial_state=encoder_states1)
-    decoder_outputs1 = tf.keras.layers.TimeDistributed(
-        tf.keras.layers.Dense(n_features))(decoder_l1)
+    def __init__(self, in_channels, out_channels, K, bias=True):
+        super(DConv, self).__init__(aggr="add", flow="source_to_target")
+        assert K > 0
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.weight = torch.nn.Parameter(
+            torch.Tensor(2, K, in_channels, out_channels))
 
-    model_e1d1 = tf.keras.models.Model(encoder_inputs, decoder_outputs1)
+        if bias:
+            self.bias = torch.nn.Parameter(torch.Tensor(out_channels))
+        else:
+            self.register_parameter("bias", None)
 
-    return model_e1d1
+        self.__reset_parameters()
+
+    def __reset_parameters(self):
+        torch.nn.init.xavier_uniform_(self.weight)
+        torch.nn.init.zeros_(self.bias)
+
+    def message(self, x_j, norm):
+        return norm.view(-1, 1) * x_j
+
+    def forward(
+        self,
+        X: torch.FloatTensor,
+        edge_index: torch.LongTensor,
+        edge_weight: torch.FloatTensor,
+    ) -> torch.FloatTensor:
+        r"""Making a forward pass. If edge weights are not present the forward pass
+        defaults to an unweighted graph.
+
+        Arg types:
+            * **X** (PyTorch Float Tensor) - Node features.
+            * **edge_index** (PyTorch Long Tensor) - Graph edge indices.
+            * **edge_weight** (PyTorch Long Tensor, optional) - Edge weight vector.
+
+        Return types:
+            * **H** (PyTorch Float Tensor) - Hidden state matrix for all nodes.
+        """
+        adj_mat = to_dense_adj(edge_index, edge_attr=edge_weight)
+        adj_mat = adj_mat.reshape(adj_mat.size(1), adj_mat.size(2))
+        deg_out = torch.matmul(
+            adj_mat, torch.ones(size=(adj_mat.size(0), 1)).to(X.device)
+        )
+        deg_out = deg_out.flatten()
+        deg_in = torch.matmul(
+            torch.ones(size=(1, adj_mat.size(0))).to(X.device), adj_mat
+        )
+        deg_in = deg_in.flatten()
+
+        deg_out_inv = torch.reciprocal(deg_out)
+        deg_in_inv = torch.reciprocal(deg_in)
+        row, col = edge_index
+        norm_out = deg_out_inv[row]
+        norm_in = deg_in_inv[row]
+
+        reverse_edge_index = adj_mat.transpose(0, 1)
+        reverse_edge_index, vv = dense_to_sparse(reverse_edge_index)
+
+        Tx_0 = X
+        Tx_1 = X
+        H = torch.matmul(Tx_0, (self.weight[0])[0]) + torch.matmul(
+            Tx_0, (self.weight[1])[0]
+        )
+
+        if self.weight.size(1) > 1:
+            Tx_1_o = self.propagate(edge_index, x=X, norm=norm_out, size=None)
+            Tx_1_i = self.propagate(
+                reverse_edge_index, x=X, norm=norm_in, size=None)
+            H = (
+                H
+                + torch.matmul(Tx_1_o, (self.weight[0])[1])
+                + torch.matmul(Tx_1_i, (self.weight[1])[1])
+            )
+
+        for k in range(2, self.weight.size(1)):
+            Tx_2_o = self.propagate(
+                edge_index, x=Tx_1_o, norm=norm_out, size=None)
+            Tx_2_o = 2.0 * Tx_2_o - Tx_0
+            Tx_2_i = self.propagate(
+                reverse_edge_index, x=Tx_1_i, norm=norm_in, size=None
+            )
+            Tx_2_i = 2.0 * Tx_2_i - Tx_0
+            H = (
+                H
+                + torch.matmul(Tx_2_o, (self.weight[0])[k])
+                + torch.matmul(Tx_2_i, (self.weight[1])[k])
+            )
+            Tx_0, Tx_1_o, Tx_1_i = Tx_1, Tx_2_o, Tx_2_i
+
+        if self.bias is not None:
+            H += self.bias
+
+        return H
 
 
-def get_model_2(n_past, n_features, n_future, units=100):
-    encoder_inputs = tf.keras.layers.Input(shape=(n_past, n_features))
-    encoder_l1 = tf.keras.layers.LSTM(
-        units, return_sequences=True, return_state=True)
-    encoder_outputs1 = encoder_l1(encoder_inputs)
-    encoder_states1 = encoder_outputs1[1:]
-    encoder_l2 = tf.keras.layers.LSTM(units, return_state=True)
-    encoder_outputs2 = encoder_l2(encoder_outputs1[0])
-    encoder_states2 = encoder_outputs2[1:]
+class DCRNN(torch.nn.Module):
+    r"""An implementation of the Diffusion Convolutional Gated Recurrent Unit.
+    For details see: `"Diffusion Convolutional Recurrent Neural Network:
+    Data-Driven Traffic Forecasting" <https://arxiv.org/abs/1707.01926>`_
 
-    decoder_inputs = tf.keras.layers.RepeatVector(
-        n_future)(encoder_outputs2[0])
+    Args:
+        in_channels (int): Number of input features.
+        out_channels (int): Number of output features.
+        K (int): Filter size :math:`K`.
+        bias (bool, optional): If set to :obj:`False`, the layer
+            will not learn an additive bias (default :obj:`True`)
 
-    decoder_l1 = tf.keras.layers.LSTM(
-        units, return_sequences=True)(
-        decoder_inputs, initial_state=encoder_states1)
-    decoder_l2 = tf.keras.layers.LSTM(
-        units, return_sequences=True)(
-        decoder_l1, initial_state=encoder_states2)
-    decoder_outputs2 = tf.keras.layers.TimeDistributed(
-        tf.keras.layers.Dense(n_features))(decoder_l2)
+    """
 
-    model_e2d2 = tf.keras.models.Model(encoder_inputs, decoder_outputs2)
+    def __init__(
+            self,
+            in_channels: int,
+            out_channels: int,
+            K: int,
+            bias: bool = True):
+        super(DCRNN, self).__init__()
 
-    return model_e2d2
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.K = K
+        self.bias = bias
+
+        self._create_parameters_and_layers()
+
+    def _create_update_gate_parameters_and_layers(self):
+        self.conv_x_z = DConv(
+            in_channels=self.in_channels + self.out_channels,
+            out_channels=self.out_channels,
+            K=self.K,
+            bias=self.bias,
+        )
+
+    def _create_reset_gate_parameters_and_layers(self):
+        self.conv_x_r = DConv(
+            in_channels=self.in_channels + self.out_channels,
+            out_channels=self.out_channels,
+            K=self.K,
+            bias=self.bias,
+        )
+
+    def _create_candidate_state_parameters_and_layers(self):
+        self.conv_x_h = DConv(
+            in_channels=self.in_channels + self.out_channels,
+            out_channels=self.out_channels,
+            K=self.K,
+            bias=self.bias,
+        )
+
+    def _create_parameters_and_layers(self):
+        self._create_update_gate_parameters_and_layers()
+        self._create_reset_gate_parameters_and_layers()
+        self._create_candidate_state_parameters_and_layers()
+
+    def _set_hidden_state(self, X, H):
+        if H is None:
+            H = torch.zeros(X.shape[0], self.out_channels).to(X.device)
+        return H
+
+    def _calculate_update_gate(self, X, edge_index, edge_weight, H):
+        Z = torch.cat([X, H], dim=1)
+        Z = self.conv_x_z(Z, edge_index, edge_weight)
+        Z = torch.sigmoid(Z)
+        return Z
+
+    def _calculate_reset_gate(self, X, edge_index, edge_weight, H):
+        R = torch.cat([X, H], dim=1)
+        R = self.conv_x_r(R, edge_index, edge_weight)
+        R = torch.sigmoid(R)
+        return R
+
+    def _calculate_candidate_state(self, X, edge_index, edge_weight, H, R):
+        H_tilde = torch.cat([X, H * R], dim=1)
+        H_tilde = self.conv_x_h(H_tilde, edge_index, edge_weight)
+        H_tilde = torch.tanh(H_tilde)
+        return H_tilde
+
+    def _calculate_hidden_state(self, Z, H, H_tilde):
+        H = Z * H + (1 - Z) * H_tilde
+        return H
+
+    def forward(
+        self,
+        X: torch.FloatTensor,
+        edge_index: torch.LongTensor,
+        edge_weight: torch.FloatTensor = None,
+        H: torch.FloatTensor = None,
+    ) -> torch.FloatTensor:
+        r"""Making a forward pass. If edge weights are not present the forward pass
+        defaults to an unweighted graph. If the hidden state matrix is not present
+        when the forward pass is called it is initialized with zeros.
+
+        Arg types:
+            * **X** (PyTorch Float Tensor) - Node features.
+            * **edge_index** (PyTorch Long Tensor) - Graph edge indices.
+            * **edge_weight** (PyTorch Long Tensor, optional) - Edge weight vector.
+            * **H** (PyTorch Float Tensor, optional) - Hidden state matrix for all nodes.
+
+        Return types:
+            * **H** (PyTorch Float Tensor) - Hidden state matrix for all nodes.
+        """
+        H = self._set_hidden_state(X, H)
+        Z = self._calculate_update_gate(X, edge_index, edge_weight, H)
+        R = self._calculate_reset_gate(X, edge_index, edge_weight, H)
+        H_tilde = self._calculate_candidate_state(
+            X, edge_index, edge_weight, H, R)
+        H = self._calculate_hidden_state(Z, H, H_tilde)
+        return H
 
 
-if __name__ == "__main__":
-    print(get_model_2(1, 1, 1, 100).summary())
+class EncoderDecoder(nn.Module):
+    """
+    An LSTM-based Encoder-Decoder model with 0.3 dropout applied for regularization.
+    """
+
+    def __init__(self, n_features, n_past, n_future, units):
+        super(EncoderDecoder, self).__init__()
+        self.n_future = n_future
+        self.units = units
+        self.dropout_rate = 0.3  # Define the dropout rate
+
+        # --- Encoder with Built-in Dropout ---
+        # The 'dropout' parameter applies dropout to the output of each layer
+        # except the last layer (only relevant if num_layers > 1).
+        self.encoder = nn.LSTM(
+            input_size=n_features,
+            hidden_size=units,
+            num_layers=1,
+            batch_first=True,
+            # For num_layers=1, this parameter is ignored for the LSTM unit itself,
+            # but we include it for clarity if the model were scaled up.
+            # dropout=self.dropout_rate
+        )
+
+        # --- Decoder with Built-in Dropout ---
+        self.decoder = nn.LSTM(
+            input_size=units,
+            hidden_size=units,
+            num_layers=1,
+            batch_first=True,
+            # dropout=self.dropout_rate
+        )
+
+        # --- Dropout Layer (Applied after Decoder) ---
+        self.dropout_layer = nn.Dropout(p=self.dropout_rate)
+
+        # --- Output Layer ---
+        self.output_layer = nn.Linear(units, n_features)
+
+    def forward(self, x):
+        # 1. ENCODER
+        encoder_output, (hidden_state, cell_state) = self.encoder(x)
+        # encoder_output = self.dropout_layer(encoder_output)
+
+        # Get the last output to use as the base for the decoder input sequence
+        last_encoder_output = encoder_output[:, -1, :]
+
+        # 2. PREPARE DECODER INPUT SEQUENCE
+        # Create a sequence of length n_future where each step is the last
+        # encoder output
+        decoder_input_sequence = last_encoder_output.unsqueeze(
+            1).repeat(1, self.n_future, 1)
+
+        # 3. DECODER
+        # Use the final hidden and cell states from the encoder to initialize
+        # the decoder
+        decoder_output, _ = self.decoder(
+            decoder_input_sequence,
+            (hidden_state, cell_state)
+        )
+
+        # 4. APPLY DROPOUT before the final Linear layer
+        # decoder_output = self.dropout_layer(decoder_output)
+
+        # 5. FINAL OUTPUT
+        predictions = self.output_layer(decoder_output)
+
+        return predictions
+
+
+class TwoLayerEncoderDecoder(nn.Module):
+    """
+    A two-layer LSTM-based Encoder-Decoder model.
+    """
+
+    def __init__(self, n_features, n_past, n_future, units):
+        super(TwoLayerEncoderDecoder, self).__init__()
+        self.n_future = n_future
+        self.units = units
+        self.n_features = n_features
+
+        self.encoder_l1 = nn.LSTM(
+            input_size=n_features,
+            hidden_size=units,
+            num_layers=1,
+            batch_first=True
+        )
+        self.encoder_l2 = nn.LSTM(
+            input_size=units,
+            hidden_size=units,
+            num_layers=1,
+            batch_first=True
+        )
+
+        self.decoder_l1 = nn.LSTM(
+            input_size=units,
+            hidden_size=units,
+            num_layers=1,
+            batch_first=True
+        )
+        self.decoder_l2 = nn.LSTM(
+            input_size=units,
+            hidden_size=units,
+            num_layers=1,
+            batch_first=True
+        )
+
+        self.output_layer = nn.Linear(units, n_features)
+        self.dropout_layer = nn.Dropout(p=0.3)
+
+    def forward(self, x):
+
+        encoder_outputs1_seq, (h1, c1) = self.encoder_l1(x)
+        encoder_outputs2_seq, (h2, c2) = self.encoder_l2(encoder_outputs1_seq)
+        encoder_outputs2_seq = self.dropout_layer(encoder_outputs2_seq)
+        last_encoder_output = encoder_outputs2_seq[:, -1, :]
+        decoder_input_sequence = last_encoder_output.unsqueeze(
+            1).repeat(1, self.n_future, 1)
+        decoder_l1_out, _ = self.decoder_l1(
+            decoder_input_sequence,
+            (h1, c1)
+        )
+        decoder_l2_out, _ = self.decoder_l2(
+            decoder_l1_out,
+            (h2, c2)
+        )
+
+        decoder_l2_out = self.dropout_layer(decoder_l2_out)
+        predictions = self.output_layer(decoder_l2_out)
+
+        return predictions
+
+
+class RecurrentGCN(torch.nn.Module):
+    def __init__(self, node_features):
+        super(RecurrentGCN, self).__init__()
+        self.recurrent = DCRNN(node_features, 32, 1)
+        self.linear = torch.nn.Linear(32, 1)
+
+    def forward(self, x, edge_index, edge_weight):
+        h = self.recurrent(x, edge_index, edge_weight)
+        h = F.relu(h)
+        h = self.linear(h)
+        return h
